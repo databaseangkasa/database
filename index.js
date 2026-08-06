@@ -10,7 +10,7 @@ const jid = "0@s.whatsapp.net";
 const vm = require('vm');
 const os = require('os');
 const mongoose = require("mongoose");
-const { BOT_TOKEN, ID_TELEGRAM } = require("./config");
+const { BOT_TOKEN, ID_TELEGRAM, MODE } = require("./config");
 const adminFile = './database/adminuser.json';
 const FormData = require("form-data");
 const https = require("https");
@@ -69,6 +69,7 @@ const pino = require('pino');
 const crypto = require('crypto');
 const chalk = require('chalk');
 const axios = require('axios');
+const { Octokit } = require('@octokit/rest');
 const moment = require('moment-timezone');
 const EventEmitter = require('events')
 const makeInMemoryStore = ({ logger = console } = {}) => {
@@ -124,6 +125,110 @@ const ev = new EventEmitter()
 
 // ------ ( Link Raw Github ) ------ //
 const GITHUB_TOKEN_LIST_URL = "https://raw.githubusercontent.com/databaseangkasa/database/refs/heads/main/Token.json";
+
+// ================== ( AUTO-UPDATE SYSTEM : DEV / PRODUCTION ) ==================
+// MODE diatur di config.js -> "production" (auto-update aktif) / "developer" (auto-update OFF)
+// DEV_ID sengaja ditaro di index.js (BUKAN config.js) supaya tetap sama walau config.js
+// beda-beda di tiap instalasi/reseller. Ini yang jadi "pengenalan data pengembang".
+const DEV_ID = "542265613"; // ID Telegram developer, punya akses eksklusif /upindex
+
+// Data repo GitHub buat auto-update & push update. Sengaja ditaro di index.js aja
+// (bukan config.js) biar config.js tetep bersih waktu di-encrypt/obfuscate buat didistribusikan.
+const GH_OWNER  = "databaseangkasa";
+const GH_REPO   = "database";
+const GH_BRANCH = "main";
+const GH_PATH   = "index.js"; // path file di repo yang jadi sumber auto-update
+
+// PAT cuma dipakai buat /upindex (push ke GitHub). WAJIB diisi manual, HANYA di file lokal
+// developer. Sebelum push, sistem otomatis blank-in baris ini di konten yang di-upload,
+// jadi PAT gak pernah ikut kebawa ke file index.js yang beredar ke user lain.
+const GH_PAT = ""; // isi manual di file dev // <- isi Personal Access Token GitHub (scope: repo) di sini
+
+const UPDATE_FILE_PATH   = "./index.js";       // file yang ditimpa waktu auto-update
+const UPDATE_STATE_FILE  = "./update-state.json"; // simpan sha + waktu update terakhir
+const NOTIF_TOKEN_FILE   = "./token.json";        // daftar chat id yang nerima notif update
+const UPDATE_CHECK_INTERVAL_MS = 90 * 1000;       // interval cek update mode production (realtime-ish)
+
+const ghApi = new Octokit(GH_PAT ? { auth: GH_PAT } : {});
+
+function loadJSON(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) {
+      fs.writeFileSync(file, JSON.stringify(fallback, null, 2));
+      return fallback;
+    }
+    return JSON.parse(fs.readFileSync(file));
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function saveJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+function getUpdateState() {
+  return loadJSON(UPDATE_STATE_FILE, { sha: null, lastUpdate: null });
+}
+
+function setUpdateState(sha) {
+  saveJSON(UPDATE_STATE_FILE, { sha, lastUpdate: new Date().toISOString() });
+}
+
+function getNotifList() {
+  return loadJSON(NOTIF_TOKEN_FILE, []);
+}
+
+// Ambil isi + sha index.js terbaru dari GitHub. Sha ini bawaan langsung dari GitHub
+// (blob sha di Contents API), jadi gak perlu hitung hash manual sendiri.
+async function fetchRemoteIndex() {
+  const { data } = await ghApi.repos.getContent({
+    owner: GH_OWNER,
+    repo: GH_REPO,
+    path: GH_PATH,
+    ref: GH_BRANCH,
+  });
+  const content = Buffer.from(data.content, "base64").toString("utf-8");
+  return { sha: data.sha, content };
+}
+
+// Broadcast 1 notif ke tiap chat id terdaftar di token.json (1x kirim per id, no spam)
+async function broadcastUpdateNotif(telegram, text) {
+  const list = getNotifList();
+  for (const chatId of list) {
+    try {
+      await telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
+    } catch (e) {
+      console.error(chalk.red(`❌ Gagal kirim notif update ke ${chatId}: ${e.message}`));
+    }
+  }
+}
+
+// Cek sha lokal vs sha GitHub. Kalau beda & mode production -> tarik, timpa file, restart.
+// Mode developer selalu dilewatin (skip) biar file dev gak pernah ke-overwrite otomatis.
+async function checkAndApplyUpdate({ silent = true } = {}) {
+  if (MODE === "developer") return false;
+
+  try {
+    const state = getUpdateState();
+    const remote = await fetchRemoteIndex();
+
+    if (state.sha && state.sha === remote.sha) {
+      if (!silent) console.log(chalk.gray("ℹ️ ☇ Sudah versi terbaru, gak ada update."));
+      return false;
+    }
+
+    fs.writeFileSync(UPDATE_FILE_PATH, remote.content);
+    setUpdateState(remote.sha);
+    console.log(chalk.green(`✅ ☇ Auto-update diterapkan (sha: ${remote.sha.slice(0, 7)}), restarting...`));
+    setTimeout(() => process.exit(0), 1200);
+    return true;
+  } catch (e) {
+    console.error(chalk.red("❌ ☇ Gagal cek/terapkan auto-update:", e.message));
+    return false;
+  }
+}
+// ================================================================================
 
 // ------ ( Create Safe Sock ) ------ //
 function createSafeSock(sock) {
@@ -1770,64 +1875,100 @@ SARAN SET COOLDOWN 3 DETIK</blockquote>
     }
 });
 //------------------(AUTO - UPDATE SYSTEM)--------------------//
-bot.command("update", async (ctx) => doUpdate(ctx));
 
-// ✅ UPDATE URL DISINI AJA (GAK DIPISAH)
-const UPDATE_URL =
-  "https://github.com/fadzx512/DbHunter/blob/main/index.js"; // GANTI RAW URL
+// /cekupdate -> liat mode, waktu update terakhir, & status vs GitHub (owner/dev only)
+bot.command("cekupdate", async (ctx) => {
+  if (String(ctx.from.id) !== String(ID_TELEGRAM) && String(ctx.from.id) !== String(DEV_ID)) {
+    return ctx.reply("❌ ☇ Akses hanya untuk owner");
+  }
 
-// ✅ foto /start
-const thumbnailUp = "https://files.catbox.moe/j8ci57.jpg"; // GANTI (boleh file_id juga)
+  const state = getUpdateState();
+  let statusInfo = "⚠️ Gagal cek ke GitHub";
+  try {
+    const remote = await fetchRemoteIndex();
+    statusInfo = remote.sha === state.sha ? "✅ Sudah versi terbaru" : "🆕 Ada update baru tersedia";
+  } catch (e) {}
 
-// ✅ file yang mau ditimpa update (samain sama file yang dijalanin panel)
-const UPDATE_FILE_PATH = "./index.js"; // GANTI kalau panel jalanin file lain
+  await ctx.reply(
+    `🪩 <b>Status Auto-Update</b>\n\n` +
+      `Mode: <code>${MODE}</code>\n` +
+      `Last Update: <code>${state.lastUpdate || "Belum pernah update"}</code>\n` +
+      `SHA Lokal: <code>${state.sha ? state.sha.slice(0, 7) : "-"}</code>\n` +
+      `Status: ${statusInfo}`,
+    { parse_mode: "HTML" }
+  );
+});
 
-function downloadToFile(url, filePath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filePath);
+// /upindex -> KHUSUS developer (mode developer). Push index.js lokal (hasil fix dev) ke
+// GitHub, terus broadcast 1 notif ke semua chat id terdaftar di token.json.
+bot.command("upindex", async (ctx) => {
+  if (String(ctx.from.id) !== String(DEV_ID)) {
+    return ctx.reply("❌ ☇ Akses hanya untuk developer");
+  }
+  if (MODE !== "developer") {
+    return ctx.reply("❌ ☇ /upindex cuma bisa dipakai di mode developer");
+  }
+  if (!GH_PAT) {
+    return ctx.reply("❌ ☇ GH_PAT belum diisi di index.js, gak bisa push ke GitHub");
+  }
 
-    https
-      .get(url, (res) => {
-        if (res.statusCode !== 200) {
-          file.close(() => fs.unlink(filePath, () => {}));
-          return reject(new Error(`HTTP_${res.statusCode}`));
-        }
-
-        res.pipe(file);
-
-        file.on("finish", () => file.close(resolve));
-      })
-      .on("error", (err) => {
-        file.close(() => fs.unlink(filePath, () => {}));
-        reject(err);
-      });
-  });
-}
-
-async function doUpdate(ctx) {
-  if (ctx.from.id != ownerID) {
-        return ctx.reply("❌ ☇ Akses hanya untuk pemilik");
-    }
-    
-  await ctx.reply("⏳ <b>Auto Update Script...</b>\nMohon tunggu.", {
-    parse_mode: "HTML",
-  });
+  await ctx.reply("⏳ <b>Push index.js ke GitHub...</b>\nMohon tunggu.", { parse_mode: "HTML" });
 
   try {
-    await downloadToFile(UPDATE_URL, UPDATE_FILE_PATH);
+    // Ambil sha terbaru dulu, wajib buat overwrite file lewat Contents API
+    const remote = await fetchRemoteIndex();
 
-    await ctx.reply("✅ <b>Update berhasil!</b>\n♻ <i>Restarting bot...</i>", {
-      parse_mode: "HTML",
+    // Baca file lokal dev, blank-in baris GH_PAT biar token gak ikut ke-push ke repo publik
+    const localContent = fs.readFileSync(UPDATE_FILE_PATH, "utf-8");
+    const safeContent = localContent.replace(
+      /const GH_PAT = ".*?";/,
+      'const GH_PAT = ""; // isi manual di file dev'
+    );
+
+    const { data } = await ghApi.repos.createOrUpdateFileContents({
+      owner: GH_OWNER,
+      repo: GH_REPO,
+      path: GH_PATH,
+      branch: GH_BRANCH,
+      message: `update index.js via /upindex - ${new Date().toISOString()}`,
+      content: Buffer.from(safeContent, "utf-8").toString("base64"),
+      sha: remote.sha,
     });
 
-    setTimeout(() => process.exit(0), 1500);
+    setUpdateState(data.content.sha);
+
+    await ctx.reply(
+      "✅ <b>Berhasil push update ke GitHub!</b>\n♻ <i>User mode production bakal auto-update & restart otomatis.</i>",
+      { parse_mode: "HTML" }
+    );
+
+    await broadcastUpdateNotif(
+      ctx.telegram,
+      `🔥 <b>Update Baru Tersedia!</b>\n\nScript bakal auto-update & restart otomatis di pengecekan berikutnya.`
+    );
   } catch (e) {
     await ctx.reply(
-      `❌ <b>Gagal update.</b>\nReason: <code>${String(e.message || e)}</code>`,
+      `❌ <b>Gagal push update.</b>\nReason: <code>${String(e.message || e)}</code>`,
       { parse_mode: "HTML" }
     );
   }
-}
+});
+
+// /addnotif [chatId] -> daftarin chat id buat nerima notif update (owner/dev only).
+// Tanpa parameter, daftarin chat id pengirim command.
+bot.command("addnotif", async (ctx) => {
+  if (String(ctx.from.id) !== String(ID_TELEGRAM) && String(ctx.from.id) !== String(DEV_ID)) {
+    return ctx.reply("❌ ☇ Akses hanya untuk owner");
+  }
+  const target = ctx.message.text.split(" ")[1] || String(ctx.from.id);
+  const list = getNotifList();
+  if (list.includes(target)) return ctx.reply("ℹ️ ☇ Chat id ini udah terdaftar.");
+  list.push(target);
+  saveJSON(NOTIF_TOKEN_FILE, list);
+  await ctx.reply(`✅ ☇ Chat id <code>${target}</code> terdaftar buat notif update.`, {
+    parse_mode: "HTML",
+  });
+});
 
 // ------ ( Case Bug Menu ) ------ //
 bot.command("Ioscrash", checkWhatsAppConnection, checkPremium(), async (ctx) => {
@@ -2622,3 +2763,14 @@ bot.command("fixerror", async (ctx) => {
 
 // ---- ( akhir of menu ) ---- //
 bot.launch();
+
+// ------ ( Jalanin Auto-Update Check : setiap restart/ganti panel + realtime ) ------ //
+(async () => {
+  if (MODE === "production") {
+    console.log(chalk.cyan("🔄 ☇ Mode production aktif, cek update ke GitHub..."));
+    await checkAndApplyUpdate({ silent: false });
+    setInterval(() => checkAndApplyUpdate(), UPDATE_CHECK_INTERVAL_MS);
+  } else {
+    console.log(chalk.yellow("🛠️ ☇ Mode developer aktif, auto-update dinonaktifkan."));
+  }
+})();
