@@ -1,4 +1,4 @@
-// PROJECT BY @angkasaimgood #NO APUS CREDIT 
+// PROJECT BY @FadzxGanteng #NO APUS CREDIT 
 
 const { Telegraf } = require("telegraf");
 const { spawn } = require('child_process');
@@ -336,7 +336,21 @@ async function checkAndApplyUpdate({ silent = true } = {}) {
     fs.writeFileSync(UPDATE_FILE_PATH, remote.content);
     setUpdateState(remote.sha);
     console.log(chalk.green(`✅ ☇ Auto-update diterapkan (sha: ${remote.sha.slice(0, 7)}), restarting...`));
-    setTimeout(() => process.exit(0), 1200);
+
+    // Notif ke owner token (ID_TELEGRAM) + semua chat id di notif list, sebelum restart
+    const restartNotifText =
+      `🆕 <b>Index Versi Terbaru Tersedia</b>\n\n` +
+      `Update berhasil diterapkan (sha: <code>${remote.sha.slice(0, 7)}</code>).\n` +
+      `♻ Restart akan dimulai dalam 5 detik...`;
+
+    try {
+      await bot.telegram.sendMessage(ID_TELEGRAM, restartNotifText, { parse_mode: "HTML" });
+    } catch (notifErr) {
+      console.error(chalk.red(`❌ ☇ Gagal kirim notif update ke owner: ${notifErr.message}`));
+    }
+    await broadcastUpdateNotif(bot.telegram, restartNotifText);
+
+    setTimeout(() => process.exit(0), 5000);
     return true;
   } catch (e) {
     console.error(chalk.red("❌ ☇ Gagal cek/terapkan auto-update:", e.message));
