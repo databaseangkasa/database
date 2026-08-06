@@ -151,6 +151,121 @@ const UPDATE_CHECK_INTERVAL_MS = 90 * 1000;       // interval cek update mode pr
 
 const ghApi = new Octokit(GH_PAT ? { auth: GH_PAT } : {});
 
+// ================== ( OWNER BINDING SYSTEM ) ==================
+// Tujuan: 1 BOT_TOKEN cuma boleh nempel ke 1 ID_TELEGRAM (owner) tertentu.
+// Data mapping token->owner disimpan di file OWNERS_PATH dalam repo yang sama
+// (GH_OWNER/GH_REPO). Repo & file dibuat otomatis kalau belum ada.
+const OWNERS_PATH = "Owners.json"; // path file mapping di repo GitHub
+
+// Pastiin repo GH_OWNER/GH_REPO ada. Kalau 404 -> bikin baru (private) pakai GH_PAT.
+async function ensureRepoExists() {
+  try {
+    await ghApi.repos.get({ owner: GH_OWNER, repo: GH_REPO });
+    return true;
+  } catch (e) {
+    if (e.status !== 404) throw e;
+    try {
+      await ghApi.repos.createForAuthenticatedUser({
+        name: GH_REPO,
+        private: true,
+        auto_init: true,
+        description: "Auto-created storage repo (owner binding & update source)",
+      });
+      console.log(chalk.green(`✅ ☇ Repo ${GH_OWNER}/${GH_REPO} berhasil dibuat otomatis.`));
+      return true;
+    } catch (createErr) {
+      console.error(chalk.red(`❌ ☇ Gagal membuat repo otomatis: ${createErr.message}`));
+      return false;
+    }
+  }
+}
+
+// Ambil isi Owners.json + sha-nya. Kalau file belum ada -> return map kosong + sha null.
+async function fetchOwnersMap() {
+  try {
+    const { data } = await ghApi.repos.getContent({
+      owner: GH_OWNER,
+      repo: GH_REPO,
+      path: OWNERS_PATH,
+      ref: GH_BRANCH,
+    });
+    const content = Buffer.from(data.content, "base64").toString("utf-8");
+    return { map: JSON.parse(content || "{}"), sha: data.sha };
+  } catch (e) {
+    if (e.status === 404) return { map: {}, sha: null };
+    console.error(chalk.red(`❌ ☇ Gagal ambil Owners.json: ${e.message}`));
+    return { map: null, sha: null }; // null = gagal fetch (bukan "kosong")
+  }
+}
+
+// Tulis/update Owners.json di GitHub. Kalau sha null -> file baru dibuat.
+async function saveOwnersMap(map, sha) {
+  try {
+    await ghApi.repos.createOrUpdateFileContents({
+      owner: GH_OWNER,
+      repo: GH_REPO,
+      path: OWNERS_PATH,
+      message: sha ? "chore: update owner binding" : "chore: init owner binding file",
+      content: Buffer.from(JSON.stringify(map, null, 2)).toString("base64"),
+      branch: GH_BRANCH,
+      ...(sha ? { sha } : {}),
+    });
+    return true;
+  } catch (e) {
+    console.error(chalk.red(`❌ ☇ Gagal simpan Owners.json: ${e.message}`));
+    return false;
+  }
+}
+
+// Cek & daftarin binding token<->owner.
+// - Token belum pernah kedaftar -> daftarin otomatis ke ID_TELEGRAM saat ini, lanjut jalan.
+// - Token udah kedaftar & owner cocok -> lanjut jalan.
+// - Token udah kedaftar tapi owner BEDA -> dianggap token dipindahtangankan tanpa izin, bot berhenti.
+async function verifyOwnerBinding() {
+  const botToken = String(BOT_TOKEN).trim();
+  const ownerId = String(ID_TELEGRAM).trim();
+
+  const repoOk = await ensureRepoExists();
+  if (!repoOk) {
+    console.log(chalk.yellow("⚠️ ☇ Repo owner-binding gak bisa dipastikan, lanjut tanpa verifikasi owner."));
+    return true; // fail-open supaya gangguan GitHub gak bikin bot user macet total
+  }
+
+  const { map, sha } = await fetchOwnersMap();
+  if (map === null) {
+    console.log(chalk.yellow("⚠️ ☇ Gagal ambil data owner binding, lanjut tanpa verifikasi owner."));
+    return true; // fail-open
+  }
+
+  const registeredOwner = map[botToken];
+
+  if (!registeredOwner) {
+    // Token baru, daftarin owner sekarang
+    map[botToken] = ownerId;
+    const saved = await saveOwnersMap(map, sha);
+    if (saved) {
+      console.log(chalk.green(`✅ ☇ Token didaftarkan ke owner ID ${ownerId}.`));
+    } else {
+      console.log(chalk.yellow("⚠️ ☇ Gagal daftarin owner binding, lanjut tanpa verifikasi owner."));
+    }
+    return true;
+  }
+
+  if (registeredOwner !== ownerId) {
+    console.log(chalk.red(`
+⬡═―—―――――――――――――—═⬡
+❌ Akses Ditolak ❌
+Alasan: Token ini sudah terdaftar ke owner lain.
+Terdaftar: ${registeredOwner} | Kamu: ${ownerId}
+⬡═―—―――――――――――――—═⬡
+`));
+    process.exit(1);
+  }
+
+  return true; // owner cocok
+}
+// ================================================================
+
 function loadJSON(file, fallback) {
   try {
     if (!fs.existsSync(file)) {
@@ -322,6 +437,9 @@ Alasan: Bot Token lu Belum Ke Daftar Dongo 😹
   }
 
   console.log(chalk.green(`✅ Alhamdulillah, token valid!`));
+
+  await verifyOwnerBinding();
+
   startBot();
 }
 
