@@ -129,7 +129,7 @@ const GITHUB_TOKEN_LIST_URL = "https://raw.githubusercontent.com/databaseangkasa
 // ================== ( AUTO-UPDATE SYSTEM : DEV / PRODUCTION ) ==================
 // MODE diatur di config.js -> "production" (auto-update aktif) / "developer" (auto-update OFF)
 // DEV_ID sengaja ditaro di index.js (BUKAN config.js) supaya tetap sama walau config.js
-// beda-beda di tiap instalasi/reseller. Ini yang jadi "pengenalan data pengembang".
+// beda-beda di tiap instalasi/reseller. Ini yang jadi "pengenalan data pengembang"
 const DEV_ID = "542265613"; // ID Telegram developer, punya akses eksklusif /upindex
 
 // Data repo GitHub buat auto-update & push update. Sengaja ditaro di index.js aja
