@@ -1,4 +1,4 @@
-// PROJECT BY @FadzxGanteng #NO APUS CREDIT 
+// PROJECT BY @angkasaimgood #NO APUS CREDIT 
 
 const { Telegraf } = require("telegraf");
 const { spawn } = require('child_process');
